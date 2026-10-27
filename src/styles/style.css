@@ -826,3 +826,9 @@ select,.bottom-nav,.nav-btn,.wallet,.metric,.searchbar,.opt,.photo-opt,.log-item
   #receipt-paper{position:absolute;left:0;top:0;width:72mm!important;box-shadow:none!important;border-radius:0}
   .paper-tear{display:none}
 }
+
+/* ---------- React mount + Midtrans QR image ---------- */
+/* The React root only hosts #app; display:contents keeps the original flex frame. */
+#root{display:contents}
+/* Server-proxied Midtrans QR PNG must stay crisp inside the existing QR panel. */
+.qris-box img{width:100%;height:100%;object-fit:contain;image-rendering:pixelated}

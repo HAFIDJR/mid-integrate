@@ -1,0 +1,20 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+dist-server/
+
+# local data / payment metadata
+.data/
+*.log
+
+# environment files (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# editor / OS
+.DS_Store
+coverage/
+.vite/
