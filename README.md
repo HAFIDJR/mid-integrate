@@ -50,7 +50,8 @@ browser bundle.
 | `MIDTRANS_SERVER_KEY`          | *(empty)*            | Midtrans server key. Empty = QRIS disabled. **Secret.**         |
 | `MIDTRANS_IS_PRODUCTION`       | `false`              | `false` = `api.sandbox.midtrans.com`, `true` = `api.midtrans.com` |
 | `MIDTRANS_QRIS_EXPIRY_MINUTES` | `15`                 | Requested QR validity (1–10080 minutes)                         |
-| `MIDTRANS_QRIS_ACQUIRER`       | *(empty)*            | Optional acquirer, e.g. `gopay`                                 |
+| `MIDTRANS_QRIS_ACQUIRER`       | *(empty)*            | `gopay` or `airpay shopee` (anything else fails at startup)     |
+| `MIDTRANS_DEV_SIMULATE`        | `0`                  | Dev only: enables the local "settle this order" endpoint        |
 | `MIDTRANS_TIMEOUT_MS`          | `12000`              | Timeout for outbound Midtrans calls                             |
 | `PORT`                         | `3001`               | API/server port                                                 |
 | `HOST`                         | `0.0.0.0`            | Bind address                                                    |
@@ -99,8 +100,9 @@ Server (`server/`):
   environment. Replaying the same `Idempotency-Key` returns the existing order instead of charging
   twice.
 - `GET /api/payments/:orderId/status` — asks Midtrans for the current status and maps it
-  (`pending` / `paid` / `expired` / `canceled` / `denied` / `failed` / `unknown`). Only `settlement`
-  (or `capture` with `accept`) counts as **paid**.
+  (`pending` / `paid` / `expired` / `canceled` / `denied` / `failed` / `unknown`). Only a verified
+  `settlement` counts as **paid**; `capture`/`authorize` stay `pending` until they settle, while
+  `expire` / `cancel` / `deny` / `failure` are terminal non-payments.
 - `POST /api/payments/midtrans/notification` — verifies `signature_key`
   (`SHA-512(order_id + status_code + gross_amount + serverKey)`), validates the order id and amount,
   then stores the new status. Notifications can arrive many times; the handler is idempotent.
@@ -127,6 +129,47 @@ Successful QRIS sales print the receipt once (after the DOM/fonts are ready) and
 once (after `afterprint`, with a bounded fallback). Cash and Card keep the original manual receipt and
 Print button.
 
+## Simulating a payment
+
+The QR cannot be paid with a real e-wallet, and this preview has no server key. There are two ways to
+drive a QRIS order to `paid` while developing.
+
+### A. Midtrans's own simulator (closest to production)
+
+```bash
+# print the raw Midtrans QR URL for the newest order
+node -e "const o=require('./.data/orders.json');o.forEach(x=>console.log(x.orderId, x.status, x.qrImageUrl))"
+```
+
+Paste that `https://api.sandbox.midtrans.com/v2/qris/<uuid>/qr-code` URL into
+<https://simulator.sandbox.midtrans.com/v2/qris/index> → **Scan QR** → pick an issuer → Pay.
+
+> If the simulator answers **`error=116 merchant not found`**, the charge itself succeeded (there is a
+> QR) but the simulator cannot resolve the merchant that issued it. On sandbox the default acquirer
+> is GoPay, and GoPay-acquired QRs are not payable on every sandbox account. Set
+> `MIDTRANS_QRIS_ACQUIRER=airpay shopee`, restart, and generate a **new** QR — the server will not
+> hand back a pending QR issued through a different acquirer. If it still fails, try the older
+> <https://simulator.sandbox.midtrans.com/qris/index> or the GoPay QR simulator, and make sure the
+> sandbox key is paired with `MIDTRANS_IS_PRODUCTION=false`.
+
+### B. Local settlement (no simulator, no network)
+
+Set `MIDTRANS_DEV_SIMULATE=1` (the server logs a warning at startup), ring up a sale, then settle the
+order directly:
+
+```bash
+# replace with the order id shown in the payment panel / .data/orders.json
+curl -X POST http://localhost:3001/api/payments/<ORDER_ID>/simulate \
+  -H 'content-type: application/json' -d '{"outcome":"paid"}'
+```
+
+`outcome` is `paid` (default), `expired`, `canceled`, `denied` or `failed`. The response is written
+through the same normalized status the verified status endpoint produces, so the browser polls,
+finalizes, prints and reloads exactly as it would for a real settlement — and the sale is tagged with
+a `SIM-<orderId>` transaction id so it is obviously a simulation. Repeat calls are idempotent, a paid
+order can never move back to a weaker state, and the endpoint returns `404` unless the flag is on.
+It is **always disabled** when `MIDTRANS_IS_PRODUCTION=true`.
+
 ## Data and privacy
 
 `localStorage` keys are unchanged from the vanilla app: `kasir_onboarded`, `kasir_store`,
@@ -151,7 +194,23 @@ npm test
 - `tests/client/*` — pending-order guards, polling/idempotent finalization, print/reload coordinator,
   storage migration and a full QRIS checkout with a mocked `fetch`.
 
-No real credentials are needed: every Midtrans call is stubbed.
+No real credentials are needed: every Midtrans call is stubbed, including the dev simulation
+endpoint.
+
+### TypeScript project layout
+
+Three projects, because the browser bundle must not see Node types:
+
+| Project                | Covers                                       | Types                 |
+| ---------------------- | -------------------------------------------- | --------------------- |
+| `tsconfig.json`        | `src/`, `vite.config.ts`, `vitest.config.ts` | `vite/client`         |
+| `tsconfig.server.json` | `server/` (build output: `dist-server/`)     | `node`                |
+| `tsconfig.test.json`   | `tests/` + `src/`                            | `node` + `vite/client` |
+
+`server/tsconfig.json` and `tests/tsconfig.json` are one-line `extends` files. Editors check a file
+against the *nearest* `tsconfig.json`, so this keeps server/test files on the Node types instead of
+reporting `Cannot find name 'node:fs'`. `npm run typecheck` checks all three projects; if your editor
+ever disagrees with the CLI, restart its TS server.
 
 ## Limitations
 

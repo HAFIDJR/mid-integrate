@@ -4,7 +4,7 @@ import path from 'node:path';
 import request from 'supertest';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../../server/app';
-import { loadConfig, type ServerConfig } from '../../server/config';
+import { ConfigError, loadConfig, type ServerConfig } from '../../server/config';
 import {
   MidtransError,
   buildNotificationSignature,
@@ -396,5 +396,206 @@ describe('durable order metadata', () => {
     const status = await request(secondApp).get(`/api/payments/${orderId}/status`);
     expect(status.body.status).toBe('paid');
     await fsp.rm(dir, { recursive: true, force: true });
+  });
+});
+
+describe('dev-only payment simulation', () => {
+  async function simulateApp(overrides: Partial<ServerConfig> = {}) {
+    const simulationConfig: ServerConfig = config({ devSimulate: true, ...overrides });
+    const simulationStore = await OrderStore.open(':memory:');
+    const simulationGateway = new FakeGateway();
+    return {
+      store: simulationStore,
+      gateway: simulationGateway,
+      app: createApp({
+        config: simulationConfig,
+        store: simulationStore,
+        gateway: simulationGateway,
+        statusRefreshMs: 0,
+      }),
+    };
+  }
+
+  it('is disabled by default and looks like a missing route', async () => {
+    const orderId = await createOrder();
+    const response = await request(app)
+      .post(`/api/payments/${orderId}/simulate`)
+      .send({ outcome: 'paid' });
+    expect(response.status).toBe(404);
+    expect(response.body).toEqual({ error: 'not_found' });
+    expect(store.get(orderId)?.status).toBe('pending');
+  });
+
+  it('is never enabled when MIDTRANS_IS_PRODUCTION=true', async () => {
+    const parsed = loadConfig({
+      MIDTRANS_SERVER_KEY: SERVER_KEY,
+      MIDTRANS_IS_PRODUCTION: 'true',
+      MIDTRANS_DEV_SIMULATE: '1',
+    });
+    expect(parsed.devSimulate).toBe(false);
+    expect(parsed.midtrans.isProduction).toBe(true);
+  });
+
+  it('settles an order so the status endpoint reports a verified payment', async () => {
+    const harness = await simulateApp();
+    const created = await request(harness.app).post('/api/payments/qris').send(cartBody);
+    const orderId = created.body.orderId as string;
+
+    const response = await request(harness.app)
+      .post(`/api/payments/${orderId}/simulate`)
+      .send({ outcome: 'paid' });
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      ok: true,
+      simulated: true,
+      orderId,
+      status: 'paid',
+    });
+
+    const status = await request(harness.app).get(`/api/payments/${orderId}/status`);
+    expect(status.body.status).toBe('paid');
+    expect(status.body.verified).toBe(true);
+    expect(status.body.transactionId).toBe(`SIM-${orderId}`);
+    expect(harness.gateway.statuses.size).toBe(0); // never asked Midtrans
+    await harness.store.clear();
+  });
+
+  it('defaults to paid and is idempotent', async () => {
+    const harness = await simulateApp();
+    const created = await request(harness.app).post('/api/payments/qris').send(cartBody);
+    const orderId = created.body.orderId as string;
+
+    const first = await request(harness.app).post(`/api/payments/${orderId}/simulate`).send({});
+    const second = await request(harness.app)
+      .post(`/api/payments/${orderId}/simulate`)
+      .send({ outcome: 'paid' });
+    expect(first.body.status).toBe('paid');
+    expect(second.body.status).toBe('paid');
+
+    // A paid order can never be pushed back to a weaker state.
+    const expired = await request(harness.app)
+      .post(`/api/payments/${orderId}/simulate`)
+      .send({ outcome: 'expired' });
+    expect(expired.body.status).toBe('paid');
+    await harness.store.clear();
+  });
+
+  it.each([
+    ['expired', 'expired'],
+    ['denied', 'denied'],
+    ['canceled', 'canceled'],
+    ['failed', 'failed'],
+  ])('can simulate a %s outcome that never becomes a sale', async (outcome, expected) => {
+    const harness = await simulateApp();
+    const created = await request(harness.app).post('/api/payments/qris').send(cartBody);
+    const orderId = created.body.orderId as string;
+
+    const response = await request(harness.app)
+      .post(`/api/payments/${orderId}/simulate`)
+      .send({ outcome });
+    expect(response.status).toBe(200);
+    expect(response.body.status).toBe(expected);
+
+    const status = await request(harness.app).get(`/api/payments/${orderId}/status`);
+    expect(status.body.status).toBe(expected);
+    expect(status.body.verified).toBe(false);
+    await harness.store.clear();
+  });
+
+  it('rejects unknown outcomes and unknown orders', async () => {
+    const harness = await simulateApp();
+    const created = await request(harness.app).post('/api/payments/qris').send(cartBody);
+    const orderId = created.body.orderId as string;
+
+    const badOutcome = await request(harness.app)
+      .post(`/api/payments/${orderId}/simulate`)
+      .send({ outcome: 'refunded-please' });
+    expect(badOutcome.status).toBe(400);
+    expect(badOutcome.body.error).toBe('invalid_outcome');
+
+    const missing = await request(harness.app)
+      .post('/api/payments/KASIR-MISSING/simulate')
+      .send({ outcome: 'paid' });
+    expect(missing.status).toBe(404);
+    expect(missing.body.error).toBe('order_not_found');
+    await harness.store.clear();
+  });
+
+  it('advertises the flag only while it is enabled', async () => {
+    const harness = await simulateApp();
+    const on = await request(harness.app).get('/api/payments/config');
+    expect(on.body.devSimulate).toBe(true);
+    await harness.store.clear();
+
+    const off = await request(app).get('/api/payments/config');
+    expect(off.body.devSimulate).toBeUndefined();
+  });
+});
+
+describe('QRIS acquirer configuration', () => {
+  it('accepts the two acquirers Midtrans supports, normalizing case', () => {
+    expect(
+      loadConfig({ MIDTRANS_SERVER_KEY: SERVER_KEY, MIDTRANS_QRIS_ACQUIRER: 'GoPay' }).midtrans
+        .acquirer,
+    ).toBe('gopay');
+    expect(
+      loadConfig({
+        MIDTRANS_SERVER_KEY: SERVER_KEY,
+        MIDTRANS_QRIS_ACQUIRER: ' airpay shopee ',
+      }).midtrans.acquirer,
+    ).toBe('airpay shopee');
+    expect(loadConfig({ MIDTRANS_SERVER_KEY: SERVER_KEY }).midtrans.acquirer).toBeUndefined();
+  });
+
+  it('fails fast on an acquirer Midtrans would reject', () => {
+    expect(() =>
+      loadConfig({ MIDTRANS_SERVER_KEY: SERVER_KEY, MIDTRANS_QRIS_ACQUIRER: 'shopeepay' }),
+    ).toThrow(ConfigError);
+    expect(() =>
+      loadConfig({ MIDTRANS_SERVER_KEY: SERVER_KEY, MIDTRANS_QRIS_ACQUIRER: 'shopeepay' }),
+    ).toThrow(/MIDTRANS_QRIS_ACQUIRER/);
+  });
+
+  it('issues a new QR when the acquirer changes instead of reusing the old one', async () => {
+    const goPayConfig = config();
+    const goPayStore = await OrderStore.open(':memory:');
+    const goPayApp = createApp({
+      config: goPayConfig,
+      store: goPayStore,
+      gateway,
+      statusRefreshMs: 0,
+    });
+    const first = await request(goPayApp)
+      .post('/api/payments/qris')
+      .send({ ...cartBody, idempotencyKey: 'idem-key-acq-gopay' });
+    expect(first.status).toBe(201);
+
+    // Same cart, but the operator switched MIDTRANS_QRIS_ACQUIRER and restarted.
+    const shopeeConfig = config({
+      midtrans: { ...goPayConfig.midtrans, acquirer: 'airpay shopee' },
+    });
+    const shopeeApp = createApp({
+      config: shopeeConfig,
+      store: goPayStore,
+      gateway,
+      statusRefreshMs: 0,
+    });
+    const second = await request(shopeeApp)
+      .post('/api/payments/qris')
+      .send({ ...cartBody, idempotencyKey: 'idem-key-acq-shopee' });
+    expect(second.status).toBe(201);
+    expect(second.body.orderId).not.toBe(first.body.orderId);
+    expect(goPayStore.get(second.body.orderId)?.acquirer).toBe('airpay shopee');
+    expect(goPayStore.get(first.body.orderId)?.acquirer).toBeNull();
+    expect(gateway.charges).toHaveLength(2);
+
+    // ...and with the same acquirer a new attempt still reuses the pending order.
+    const third = await request(shopeeApp)
+      .post('/api/payments/qris')
+      .send({ ...cartBody, idempotencyKey: 'idem-key-acq-shopee-2' });
+    expect(third.status).toBe(200);
+    expect(third.body.orderId).toBe(second.body.orderId);
+    expect(gateway.charges).toHaveLength(2);
+    await goPayStore.clear();
   });
 });

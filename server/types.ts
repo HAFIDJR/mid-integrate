@@ -39,6 +39,8 @@ export interface OrderRecord {
   paidAt: string | null;
   lastCheckedAt: number;
   environment: 'sandbox' | 'production';
+  /** QRIS acquirer the charge was created with (`null` = Midtrans default). */
+  acquirer: string | null;
   /** Internal only: authenticated Midtrans QR image URL. Never sent to the browser. */
   qrImageUrl: string | null;
   /** Internal only: last safe error code (no credentials / upstream bodies). */

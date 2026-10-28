@@ -1,0 +1,5 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "//": "Editor entry point for the test suite. tsserver resolves the *nearest* tsconfig.json, so tests/ is checked with Node + Vite types instead of the browser-only web project. CLI config: ../tsconfig.test.json.",
+  "extends": "../tsconfig.test.json"
+}
