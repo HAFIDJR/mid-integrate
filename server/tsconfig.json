@@ -1,0 +1,5 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "//": "Editor entry point for server code. tsserver resolves the *nearest* tsconfig.json, so files under server/ are checked with the Node types instead of the browser/web project. Build config: ../tsconfig.server.json.",
+  "extends": "../tsconfig.server.json"
+}

@@ -68,11 +68,20 @@ export class OrderStore {
     return found;
   }
 
-  findReusablePending(cartHash: string, amount: number, now = Date.now()): OrderRecord | undefined {
+  findReusablePending(
+    cartHash: string,
+    amount: number,
+    now = Date.now(),
+    acquirer: string | null = null,
+  ): OrderRecord | undefined {
     let found: OrderRecord | undefined;
     for (const order of this.orders.values()) {
       if (order.status !== 'pending') continue;
       if (order.cartHash !== cartHash || order.amount !== amount) continue;
+      // Changing MIDTRANS_QRIS_ACQUIRER must produce a fresh QR, not hand back the
+      // old (possibly unpayable) one. Orders stored before this field existed had
+      // the Midtrans default acquirer, i.e. null.
+      if ((order.acquirer ?? null) !== acquirer) continue;
       if (order.expiresAt && new Date(order.expiresAt).getTime() <= now) continue;
       if (!found || order.createdAt > found.createdAt) found = order;
     }

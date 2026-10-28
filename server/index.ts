@@ -43,6 +43,11 @@ async function main() {
       `[kasir] Midtrans: ${isMidtransConfigured(config) ? `configured (${env})` : 'NOT configured — QRIS charges are disabled'}`,
     );
     console.log(`[kasir] Order store: ${config.orderStorePath}`);
+    if (config.devSimulate) {
+      console.warn(
+        '[kasir] DEV payment simulation ENABLED — POST /api/payments/:orderId/simulate settles orders locally. Never enable this in production.',
+      );
+    }
   });
 
   const shutdown = (signal: string) => {

@@ -26,6 +26,18 @@ export interface AppDependencies {
 const RATE_WINDOW_MS = 60_000;
 const RATE_MAX_CHARGES = 40;
 
+/** Raw Midtrans statuses used by the dev-only simulation endpoint. */
+const SIMULATED_OUTCOMES: Record<
+  string,
+  { rawStatus: string; fraudStatus: string | null }
+> = {
+  paid: { rawStatus: 'settlement', fraudStatus: 'accept' },
+  expired: { rawStatus: 'expire', fraudStatus: null },
+  canceled: { rawStatus: 'cancel', fraudStatus: null },
+  denied: { rawStatus: 'deny', fraudStatus: 'deny' },
+  failed: { rawStatus: 'failure', fraudStatus: null },
+};
+
 function environmentOf(config: ServerConfig): 'sandbox' | 'production' {
   return config.midtrans.isProduction ? 'production' : 'sandbox';
 }
@@ -165,6 +177,7 @@ export function createApp({
       configured: gateway.isConfigured(),
       environment: environmentOf(config),
       qrisExpiryMinutes: config.midtrans.qrisExpiryMinutes,
+      ...(config.devSimulate ? { devSimulate: true } : {}),
     });
   });
 
@@ -199,7 +212,8 @@ export function createApp({
       }
     }
 
-    const reusable = store.findReusablePending(cartHash, amount, timestamp.getTime());
+    const acquirer = config.midtrans.acquirer ?? null;
+    const reusable = store.findReusablePending(cartHash, amount, timestamp.getTime(), acquirer);
     if (reusable) {
       return res.status(200).json(toPublicCharge(reusable, config));
     }
@@ -225,6 +239,7 @@ export function createApp({
       paidAt: null,
       lastCheckedAt: 0,
       environment: environmentOf(config),
+      acquirer,
       qrImageUrl: null,
       lastError: null,
     };
@@ -412,6 +427,59 @@ export function createApp({
     );
     const updated = await store.update(orderId, { ...patch, lastError: null });
     return res.json({ ok: true, orderId, status: updated?.status ?? order.status });
+  });
+
+  /* --------------------- dev-only settlement simulation ------------------ */
+  /**
+   * Settle (or fail) an order locally, instead of paying it in Midtrans's web
+   * simulator. This is a development aid: it writes the same normalized status the
+   * verified status endpoint would, so the browser's normal polling/finalization
+   * path runs unchanged. Disabled unless MIDTRANS_DEV_SIMULATE=1, and never in
+   * production. It is not a substitute for a real verified payment.
+   */
+  app.post('/api/payments/:orderId/simulate', async (req, res) => {
+    if (!config.devSimulate) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+    const orderId = String(req.params.orderId || '');
+    const order = store.get(orderId);
+    if (!order) {
+      return res.status(404).json({ error: 'order_not_found', message: 'Unknown order id' });
+    }
+    const requested =
+      typeof (req.body as Record<string, unknown> | undefined)?.outcome === 'string'
+        ? String((req.body as Record<string, unknown>).outcome).toLowerCase()
+        : 'paid';
+    const outcome = SIMULATED_OUTCOMES[requested];
+    if (!outcome) {
+      return res.status(400).json({
+        error: 'invalid_outcome',
+        message: `outcome must be one of: ${Object.keys(SIMULATED_OUTCOMES).join(', ')}`,
+      });
+    }
+    const timestamp = now();
+    const { patch } = buildStatusPatch(
+      order,
+      {
+        rawStatus: outcome.rawStatus,
+        fraudStatus: outcome.fraudStatus,
+        // Always label a simulated settlement so it is obvious in the receipt /
+        // Reports that no real Midtrans transaction produced it.
+        transactionId: `SIM-${orderId}`,
+        transactionTime: timestamp.toISOString(),
+        expiryTime: order.expiresAt,
+        amount: order.amount,
+      },
+      timestamp,
+    );
+    const updated = await store.update(orderId, { ...patch, lastError: null });
+    console.warn(`[payments] DEV simulated "${requested}" for order ${orderId}`);
+    return res.json({
+      ok: true,
+      simulated: true,
+      orderId,
+      status: updated?.status ?? order.status,
+    });
   });
 
   app.use('/api', (_req, res) => {
